@@ -87,6 +87,8 @@ namespace NetworkLibrary.P2P.Generic
             } 
         }
 
+        public AesMode AESMode = AesMode.GCM;
+
         public ConcurrentDictionary<Guid, bool> Peers = new ConcurrentDictionary<Guid, bool>();
         internal ConcurrentDictionary<Guid, PeerInformation> PeerInfos { get; private set; } = new ConcurrentDictionary<Guid, PeerInformation>();
         internal ConcurrentDictionary<Guid, List<ReliableUdpModule>> RUdpModules = new ConcurrentDictionary<Guid, List<ReliableUdpModule>>();
@@ -111,7 +113,6 @@ namespace NetworkLibrary.P2P.Generic
         private ConcurrentDictionary<Guid, AesTcpModule<S>> punchedTcpModules = new ConcurrentDictionary<Guid, AesTcpModule<S>>();
         internal ConcurrentDictionary<IPEndPoint, CryptoInfo> peerCryptos = new ConcurrentDictionary<IPEndPoint, CryptoInfo>();
         private ClientStateManager<S> clientStateManager;
-        public AesMode AESMode = AesMode.GCM;
         private X509Certificate2 clientCert;
         private int udpPort = 0;
         private bool initialised = false;
@@ -307,7 +308,7 @@ namespace NetworkLibrary.P2P.Generic
                 Peers.Clear();
 
                 peerCryptos.Clear();
-                punchedEndpoints.Clear();
+                ClearPunchedEndpoints();
 
                 foreach (var item in RUdpModules)
                 {
@@ -427,7 +428,7 @@ namespace NetworkLibrary.P2P.Generic
                 if (isTcp)
                 {
                     message.To = message.From;
-                    if(punchedTcpModules.TryGetValue(message.From,out var module))
+                    if(TryGetAesTcpModule(message.From,out var module))
                     {
                         message.From = sessionId;
 
@@ -473,13 +474,10 @@ namespace NetworkLibrary.P2P.Generic
 
         #endregion Ping
 
-        #region Send
-
-        private void SendUdpMesssageInternal(Guid toId, MessageEnvelope message)
+        #region Wrap
+        private void GetUdpSendParams(Guid toId, out ConcurrentAesAlgorithm algo, out IPEndPoint endpoint)
         {
-            ConcurrentAesAlgorithm algo;
-            IPEndPoint endpoint;
-            if (punchedEndpoints.TryGetValue(toId, out EndpointGroup endpoints))
+            if (TryGetTraversedEndpoint(toId, out var endpoints))
             {
                 endpoint = endpoints.ToSend;
                 algo = peerCryptos[endpoint].algorithm;
@@ -488,7 +486,76 @@ namespace NetworkLibrary.P2P.Generic
             {
                 endpoint = relayServerEndpoint;
                 algo = udpEncryiptor;
+
             }
+        }
+
+        private bool IsUdpDirectConnectionAvailable(Guid clientId)
+        {
+            return punchedEndpoints.ContainsKey(clientId);
+        }
+
+        private bool TryGetTraversedEndpoint(Guid target, out EndpointGroup ep)
+        {
+            return punchedEndpoints.TryGetValue(target, out ep);
+        }
+
+        private bool AddPunchedEndpoint(Guid clientId,EndpointGroup endpoints)
+        {
+            return punchedEndpoints.TryAdd(clientId, endpoints);
+        }
+
+        private bool RemovePunchedEndpoint(Guid clientId, out EndpointGroup endpoints)
+        {
+            return punchedEndpoints.TryRemove(clientId, out endpoints);
+        }
+
+        private void ClearPunchedEndpoints()
+        {
+            punchedEndpoints.Clear();
+        }
+
+        private bool TryGetAesTcpModule(Guid clientId, out AesTcpModule<S> module)
+        {
+            return punchedTcpModules.TryGetValue(clientId, out module);
+        }
+
+        private bool AddPunchedTcpModule(Guid clientId, AesTcpModule<S> tcpModule)
+        {
+            return punchedTcpModules.TryAdd(clientId, tcpModule);
+        }
+
+        private bool RemovePunchedTcpModule(Guid clientId, out AesTcpModule<S> tcpModule)
+        {
+            return punchedTcpModules.TryRemove(clientId, out tcpModule);
+        }
+
+        private void ClearPunchedTcpModules()
+        {
+            punchedTcpModules.Clear();
+        }
+
+        private bool TryGetRudpModules(Guid clientId, out List<ReliableUdpModule> mod)
+        {
+            return RUdpModules.TryGetValue(clientId, out mod);
+        }
+
+        private bool TryAddRUdpModules(Guid clientId, List<ReliableUdpModule> mod)
+        {
+            return RUdpModules.TryAdd(clientId, mod);
+        }
+
+        private void TryGetJumboUdpModule()
+        {
+
+        }
+        #endregion
+
+        #region Send
+
+        private void SendUdpMesssageInternal(Guid toId, MessageEnvelope message)
+        {
+            GetUdpSendParams(toId, out ConcurrentAesAlgorithm algo, out IPEndPoint endpoint);
 
             if (message.PayloadCount > maxUdpPackageSize)
             {
@@ -509,7 +576,7 @@ namespace NetworkLibrary.P2P.Generic
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private unsafe void SendLargeUdpMessage(Guid toId, MessageEnvelope message)
         {
-            // you cat store buffer outside the scope..
+            // you cant store buffer outside the scope..
             if (message.KeyValuePairs != null)
             {
                 var buffer = stackalloc byte[65000];
@@ -536,19 +603,7 @@ namespace NetworkLibrary.P2P.Generic
 
         private void SendUdpMesssageInternal<T>(Guid toId, MessageEnvelope message, T innerMessage)
         {
-            ConcurrentAesAlgorithm algo;
-            IPEndPoint endpoint;
-            if (punchedEndpoints.TryGetValue(toId, out var endpoints))
-            {
-                endpoint = endpoints.ToSend;
-                algo = peerCryptos[endpoint].algorithm;
-            }
-            else
-            {
-                endpoint = relayServerEndpoint;
-                algo = udpEncryiptor;
-
-            }
+            GetUdpSendParams(toId, out ConcurrentAesAlgorithm algo, out IPEndPoint endpoint);
 
             if (!udpServer.TrySendAsync(endpoint, message, innerMessage, algo, out var excessStream))
             {
@@ -563,21 +618,10 @@ namespace NetworkLibrary.P2P.Generic
 
         private void SendUdpMesssageInternal(Guid toId, MessageEnvelope message, Action<PooledMemoryStream> serializationCallback)
         {
-            ConcurrentAesAlgorithm algo;
-            IPEndPoint endpoint;
-            if (punchedEndpoints.TryGetValue(toId, out var endpoints))
-            {
-                endpoint = endpoints.ToSend;
-                algo = peerCryptos[endpoint].algorithm;
-            }
-            else
-            {
-                endpoint = relayServerEndpoint;
-                algo = udpEncryiptor;
+           
+            GetUdpSendParams(toId, out ConcurrentAesAlgorithm algo, out IPEndPoint endpoint);
 
-            }
-
-            if (!udpServer.TrySendAsync(endpoint, message, serializationCallback, algo, out var excessStream,false))
+            if (!udpServer.TrySendAsync(endpoint, message, serializationCallback, algo, out var excessStream, false))
             {
                 if (JumboUdpModules.TryGetValue(toId, out var mod))
                     mod.Send(excessStream.GetBuffer(), 0, excessStream.Position32);
@@ -587,7 +631,6 @@ namespace NetworkLibrary.P2P.Generic
             }
 
         }
-
 
         /// <summary>
         /// Sends the UDP message with bytes provided in envelope payload.
@@ -643,7 +686,10 @@ namespace NetworkLibrary.P2P.Generic
         }
 
 
-        #region Broadcast/Multicast Udp        
+        #region Broadcast/Multicast Udp       
+        
+       
+
         /// <summary>
         /// Broadcasts the UDP message to all connected peers.
         /// </summary>
@@ -656,7 +702,7 @@ namespace NetworkLibrary.P2P.Generic
                 bool sendToRelay = false;
                 foreach (var item in Peers)
                 {
-                    if (punchedEndpoints.ContainsKey(item.Key))
+                    if (IsUdpDirectConnectionAvailable(item.Key))
                     {
                         message.To = item.Key;
                         SendUdpMesssageInternal(item.Key, message);
@@ -675,7 +721,7 @@ namespace NetworkLibrary.P2P.Generic
                         // unicast, message is too large.
                         foreach (var item in Peers)
                         {
-                            if (!punchedEndpoints.ContainsKey(item.Key))
+                            if (!IsUdpDirectConnectionAvailable(item.Key))
                             {
                                 message.To = item.Key;
                                 SendUdpMesssageInternal(item.Key, message);
@@ -701,7 +747,7 @@ namespace NetworkLibrary.P2P.Generic
                 bool sendToRelay = false;
                 foreach (var item in Peers)
                 {
-                    if (punchedEndpoints.ContainsKey(item.Key))
+                    if (IsUdpDirectConnectionAvailable(item.Key))
                     {
                         message.To = item.Key;
                         SendUdpMesssageInternal(item.Key, message, innerMessage);
@@ -720,7 +766,7 @@ namespace NetworkLibrary.P2P.Generic
                         // unicast, message is too large.
                         foreach (var item in Peers)
                         {
-                            if (!punchedEndpoints.ContainsKey(item.Key))
+                            if (!IsUdpDirectConnectionAvailable(item.Key))
                             {
                                 message.To = item.Key;
                                 SendUdpMesssageInternal(item.Key, message, innerMessage);
@@ -733,13 +779,14 @@ namespace NetworkLibrary.P2P.Generic
         }
         internal void MulticastUdpMessage(MessageEnvelope message, ICollection<Guid> targets)
         {
+           
             if (Peers.Count < 0)
                 return;
             message.From = sessionId;
             bool sendToRelay = false;
             foreach (var target in targets)
             {
-                if (punchedEndpoints.TryGetValue(target, out var ep))
+                if (TryGetTraversedEndpoint(target, out var ep))
                 {
                     message.To = target;
                     SendUdpMesssageInternal(target, message);
@@ -759,7 +806,7 @@ namespace NetworkLibrary.P2P.Generic
                     {
                         if (target == sessionId)
                             continue;
-                        if (!punchedEndpoints.ContainsKey(target))
+                        if (!IsUdpDirectConnectionAvailable(target))
                         {
                             message.To = target;
                             SendUdpMesssageInternal(target, message);
@@ -778,7 +825,7 @@ namespace NetworkLibrary.P2P.Generic
             bool sendToRelay = false;
             foreach (var target in targets)
             {
-                if (punchedEndpoints.TryGetValue(target, out var ep))
+                if (TryGetTraversedEndpoint(target, out var ep))
                 {
                     message.To = target;
                     SendUdpMesssageInternal(target, message,innerMessage);
@@ -795,7 +842,7 @@ namespace NetworkLibrary.P2P.Generic
                 {
                     foreach (var target in targets)
                     {
-                        if (!punchedEndpoints.ContainsKey(target))
+                        if (!IsUdpDirectConnectionAvailable(target))
                         {
                             if (target == sessionId)
                                 continue;
@@ -804,11 +851,10 @@ namespace NetworkLibrary.P2P.Generic
                             SendUdpMesssageInternal(target, message,innerMessage);
                         }
                     }
-
                 }
             }
-
         }
+
         #endregion
 
         /// <summary>
@@ -823,7 +869,7 @@ namespace NetworkLibrary.P2P.Generic
                 //message.To = Guid.Empty;
                 foreach (var peer in Peers)
                 {
-                    if (punchedTcpModules.TryGetValue(peer.Key, out var module))
+                    if (TryGetAesTcpModule(peer.Key, out var module))
                     {
                        // message.To = peer.Key;
                         module.SendAsync(message);
@@ -866,7 +912,7 @@ namespace NetworkLibrary.P2P.Generic
 
             message.From = sessionId;
             message.To = toId;
-            if(punchedTcpModules.TryGetValue(toId, out var module))
+            if(TryGetAesTcpModule(toId, out var module))
             {
                 module.SendAsync(message);
             }
@@ -888,7 +934,7 @@ namespace NetworkLibrary.P2P.Generic
 
             envelope.From = sessionId;
             envelope.To = toId;
-            if (punchedTcpModules.TryGetValue(toId, out var module))
+            if (TryGetAesTcpModule(toId, out var module))
             {
                 module.SendAsync(envelope, message);
             }
@@ -909,7 +955,7 @@ namespace NetworkLibrary.P2P.Generic
 
             envelope.From = sessionId;
             envelope.To = toId;
-            if (punchedTcpModules.TryGetValue(toId, out var module))
+            if (TryGetAesTcpModule(toId, out var module))
             {
                 module.SendAsync(envelope,serializationCallback);
             }
@@ -936,7 +982,7 @@ namespace NetworkLibrary.P2P.Generic
             };
 
             envelope.Header = messageHeader == null ? typeof(T).Name : messageHeader;
-            if (punchedTcpModules.TryGetValue(toId, out var module))
+            if (TryGetAesTcpModule(toId, out var module))
             {
                 module.SendAsync(envelope,message);
             }
@@ -963,13 +1009,14 @@ namespace NetworkLibrary.P2P.Generic
                 MessageId = Guid.NewGuid(),
                 Header = messageHeader == null ? typeof(T).Name : messageHeader
             };
+
             Task<MessageEnvelope> task;
-            if (punchedTcpModules.TryGetValue(toId, out var module))
+            if (TryGetAesTcpModule(toId, out var module))
             {
                 task = module.SendMessageAndWaitResponse(envelope, message,timeoutMs);
             }
             else
-                 task = tcpMessageClient.SendMessageAndWaitResponse(envelope, message, timeoutMs);
+                task = tcpMessageClient.SendMessageAndWaitResponse(envelope, message, timeoutMs);
             return task;
         }
 
@@ -987,7 +1034,7 @@ namespace NetworkLibrary.P2P.Generic
             message.To = toId;
 
             Task<MessageEnvelope> task;
-            if (punchedTcpModules.TryGetValue(toId, out var module))
+            if (TryGetAesTcpModule(toId, out var module))
             {
                 task = module.SendMessageAndWaitResponse(message, timeoutMs);
             }
@@ -1011,7 +1058,7 @@ namespace NetworkLibrary.P2P.Generic
             envelope.From = sessionId;
             envelope.To = toId;
             Task<MessageEnvelope> task;
-            if (punchedTcpModules.TryGetValue(toId, out var module))
+            if (TryGetAesTcpModule(toId, out var module))
             {
                 task = module.SendMessageAndWaitResponse(envelope, message, timeoutMs);
             }
@@ -1061,7 +1108,16 @@ namespace NetworkLibrary.P2P.Generic
                         if(msg.To == Guid.Empty)
                             msg.To = sessionId;
                         if(adress != relayServerEndpoint && msg.From == Guid.Empty)
-                            msg.From = peerCryptos[adress].id;
+                        {
+                            if (crypto == null)
+                            {
+                                MiniLogger.Log(MiniLogger.LogLevel.Error, "Unable to find decrptor from " + adress);
+                                return;
+                            }
+                              
+                            msg.From = crypto.id;
+                        }
+                            
                         if (!clientStateManager.HandleMessage(adress, msg))
                         {
                             HandleUdpMessageReceived(msg);
@@ -1073,7 +1129,7 @@ namespace NetworkLibrary.P2P.Generic
                 catch (Exception e)
                 {
                     var b = decryptBuffer;
-                    MiniLogger.Log(MiniLogger.LogLevel.Error, "Relay Client Failed to deserialise envelope message " + e.Message);
+                    MiniLogger.Log(MiniLogger.LogLevel.Error, "Relay Client Failed to deserialise envelope message " + e.Message +"\n"+ e.StackTrace);
 
                 }
             }
@@ -1102,19 +1158,19 @@ namespace NetworkLibrary.P2P.Generic
                     break;
                     // reliable udp
                 case Constants.Rudp:
-                    if (RUdpModules.TryGetValue(message.From, out var mod))
+                    if (TryGetRudpModules(message.From, out var mod))
                     {
                         mod[0].HandleBytes(message.Payload, message.PayloadOffset, message.PayloadCount);
                     }
                     break;
                 case Constants.Rudp1:
-                    if (RUdpModules.TryGetValue(message.From, out var mod2))
+                    if (TryGetRudpModules(message.From, out var mod2))
                     {
                         mod2[1].HandleBytes(message.Payload, message.PayloadOffset, message.PayloadCount);
                     }
                     break;
                 case Constants.Rudp2:
-                    if (RUdpModules.TryGetValue(message.From, out var mod3))
+                    if (TryGetRudpModules(message.From, out var mod3))
                     {
                         mod3[2].HandleBytes(message.Payload, message.PayloadOffset, message.PayloadCount);
                     }
@@ -1207,7 +1263,7 @@ namespace NetworkLibrary.P2P.Generic
             {
                 return Task.FromResult(false);
             }
-            if (punchedEndpoints.ContainsKey(peerId))
+            if (IsUdpDirectConnectionAvailable(peerId))
             {
                 return Task.FromResult(true);
             }
@@ -1322,8 +1378,8 @@ namespace NetworkLibrary.P2P.Generic
                     algorithm = new ConcurrentAesAlgorithm(state.cryptoKey, AESMode)
                 });
             }
-           
-            punchedEndpoints.TryAdd(state.destinationId, new EndpointGroup() { ToReceive = state.succesfulEpToReceive,ToSend = state.succesfullEpToSend });
+
+            AddPunchedEndpoint(state.destinationId, new EndpointGroup() { ToReceive = state.succesfulEpToReceive,ToSend = state.succesfullEpToSend });
 
             MiniLogger.Log(MiniLogger.LogLevel.Info, $"HolePunched, Receive Endpoint: {state.succesfulEpToReceive}, Send Endpoint {state.succesfullEpToSend}");
         }
@@ -1432,13 +1488,13 @@ namespace NetworkLibrary.P2P.Generic
         {
             Peers.TryRemove(peerId, out _);
 
-            if (punchedEndpoints.TryRemove(peerId, out var ep) && ep != null)
+            if (RemovePunchedEndpoint(peerId, out var ep) && ep != null)
             {
                 peerCryptos.TryRemove(ep.ToReceive, out _);
                 peerCryptos.TryRemove(ep.ToSend, out _);
 
             }
-            if(punchedTcpModules.TryRemove(peerId,out var module))
+            if(RemovePunchedTcpModule(peerId,out var module))
             {
                 module.Dispose();
             }
@@ -1503,7 +1559,7 @@ namespace NetworkLibrary.P2P.Generic
             if (!Peers.TryGetValue(toId, out _) && toId != sessionId)
                 return;
             int offset = 0;
-            if (punchedEndpoints.ContainsKey(toId))
+            if (IsUdpDirectConnectionAvailable(toId))
             {
                 message.To = Guid.Empty;
                 message.From = Guid.Empty;
@@ -1526,7 +1582,7 @@ namespace NetworkLibrary.P2P.Generic
 
             ConcurrentAesAlgorithm algo;
             IPEndPoint endpoint;
-            if (punchedEndpoints.TryGetValue(toId, out var endpoints))
+            if (TryGetTraversedEndpoint(toId, out var endpoints))
             {
                 endpoint = endpoints.ToSend;
                 algo = peerCryptos[endpoint].algorithm;
@@ -1596,7 +1652,7 @@ namespace NetworkLibrary.P2P.Generic
                 mod1,
                 mod2
             };
-            RUdpModules.TryAdd(peer, l);
+            TryAddRUdpModules(peer, l);
 
         }
 
@@ -1643,7 +1699,7 @@ namespace NetworkLibrary.P2P.Generic
         /// <param name="channel">The channel.</param>
         public void SendRudpMessage(Guid to, MessageEnvelope msg, RudpChannel channel = RudpChannel.Ch1)
         {
-            if (RUdpModules.TryGetValue(to, out var mod))
+            if (TryGetRudpModules(to, out var mod))
             {
                 //WriteRudpRouterHeaderIfNeeded(msg, to);
                 msg = MessageEnvelope.CloneWithNoRouter(msg);
@@ -1675,7 +1731,7 @@ namespace NetworkLibrary.P2P.Generic
         /// <param name="channel">The channel.</param>
         public void SendRudpMessage<T>(Guid to, MessageEnvelope msg, T innerMessage, RudpChannel channel = RudpChannel.Ch1)
         {
-            if (RUdpModules.TryGetValue(to, out var mod))
+            if (TryGetRudpModules(to, out var mod))
             {
                 //WriteRudpRouterHeaderIfNeeded(msg, to);
                 msg = MessageEnvelope.CloneWithNoRouter(msg);
@@ -1699,7 +1755,7 @@ namespace NetworkLibrary.P2P.Generic
         /// <returns></returns>
         public Task<MessageEnvelope> SendRudpMessageAndWaitResponse(Guid to, MessageEnvelope msg, int timeoutMs = 10000, RudpChannel channel = RudpChannel.Ch1)
         {
-            if (RUdpModules.TryGetValue(to, out var mod))
+            if (TryGetRudpModules(to, out var mod))
             {
                 //WriteRudpRouterHeaderIfNeeded(msg, to);
                 msg = MessageEnvelope.CloneWithNoRouter(msg);
@@ -1739,7 +1795,7 @@ namespace NetworkLibrary.P2P.Generic
         /// <returns></returns>
         public Task<MessageEnvelope> SendRudpMessageAndWaitResponse<T>(Guid to, MessageEnvelope msg, T innerMessage, int timeoutMs = 10000, RudpChannel channel = RudpChannel.Ch1)
         {
-            if (RUdpModules.TryGetValue(to, out var mod))
+            if (TryGetRudpModules(to, out var mod))
             {
                 //WriteRudpRouterHeaderIfNeeded(msg, to);
                 msg = MessageEnvelope.CloneWithNoRouter(msg);
@@ -1765,7 +1821,7 @@ namespace NetworkLibrary.P2P.Generic
             msg.To = Guid.Empty;
             msg.From = Guid.Empty;
             return;
-            if (punchedEndpoints.ContainsKey(to))
+            if (IsUdpDirectConnectionAvailable(to))
             {
                 msg.To = Guid.Empty;
                 msg.From = Guid.Empty;
@@ -1840,7 +1896,7 @@ namespace NetworkLibrary.P2P.Generic
                 {
                     module.Value.Dispose();
                 }
-                punchedTcpModules.Clear();
+                ClearPunchedTcpModules();
             }    
         }
 
@@ -1860,7 +1916,7 @@ namespace NetworkLibrary.P2P.Generic
 
             }
             module.OnMessageReceived += HandleMessageReceived;
-            punchedTcpModules.TryAdd(state.destinationId, module);
+            AddPunchedTcpModule(state.destinationId, module);
           
             Console.WriteLine("REG TCP HP!!");
         }

@@ -187,20 +187,22 @@ namespace RelayBenchmark
             //string ip = "79.52.134.220";
             string ip = "127.0.0.1";
 
+            MiniLogger.AllLog += Console.WriteLine;
 
-            var cert = new X509Certificate2("client.pfx", "greenpass");
-            var scert = new X509Certificate2("server.pfx", "greenpass");
+            X509Certificate2 cert = null;//new X509Certificate2("client.pfx", "greenpass");
+            X509Certificate2 scert = null;//new X509Certificate2("server.pfx", "greenpass");
             if (Console.ReadLine() == "e")
             {
                 var server = new SecureProtoRelayServer(20020, scert);
                 server.StartServer();
-                Task.Run(async () => { while (true) { await Task.Delay(5000); server.GetTcpStatistics(out var generalStats, out _); Console.WriteLine(generalStats.ToString()); } });
+                Task.Run(async () => { while (true) { await Task.Delay(5000); server.GetTcpStatistics(out var generalStats, out _); Console.WriteLine(generalStats.ToString());
+                                                                                server.GetUdpStatistics(out var s, out _); Console.WriteLine(s.ToString()); } });
 
             }
             Console.ReadLine();
             //Task.Run(async () => { while (true) { await Task.Delay(10000); server.GetTcpStatistics(out var generalStats, out _); Console.WriteLine(generalStats.ToString()); } });
             var clients = new List<RelayClient>();
-            int numclients = 50;
+            int numclients = 2;
             var pending = new Task[numclients];
             Task.Run(async () => { while (true) { await Task.Delay(1000); Console.WriteLine(Interlocked.Exchange(ref sumsum, 0).ToString("N0")); } });
 
@@ -234,6 +236,7 @@ namespace RelayBenchmark
             {
                 if (client.SessionId == Guid.Empty)
                     throw new Exception();
+                client.StartPingService();
                 // Console.WriteLine("--- -- - | "+client.sessionId+" count: " + client.Peers.Count);
                 foreach (var peer in client.Peers)
                 {
@@ -242,10 +245,10 @@ namespace RelayBenchmark
                         if (peer.Key == Guid.Empty)
                             throw new Exception();
 
-                         //var a = client.RequestTcpHolePunchAsync(peer.Key);
-                         //pndg.Add(a);
-                       // var aa = client.RequestHolePunchAsync(peer.Key, 10000, false);
-                        //pndg.Add(aa);
+                        //var a = client.RequestTcpHolePunchAsync(peer.Key);
+                        //pndg.Add(a);
+                        var aa = client.RequestHolePunchAsync(peer.Key, 10000, false);
+                        pndg.Add(aa);
                         //client.TestHP(peer.Key, 10000, false);
                         //  Console.WriteLine(peer.Key+" cnt=> "+ ++cc);
                     }
@@ -277,8 +280,8 @@ namespace RelayBenchmark
                     foreach (var peer in client.Peers.Keys)
                     {
                         //await client.SendRequestAndWaitResponse(peer, testMessage,1000);
-                        client.SendAsyncMessage(peer, testMessage);
-                      //client.SendUdpMessage(peer, testMessage);
+                        //client.SendAsyncMessage(peer, testMessage);
+                     // client.SendUdpMessage(peer, testMessage);
                       // client.SendRudpMessage(peer, testMessage);
                         //  client.BroadcastMessage(testMessage);
                         //client.BroadcastUdpMessage(testMessage);
@@ -306,6 +309,7 @@ namespace RelayBenchmark
 
             void ClientUdpReceived(RelayClient client, MessageEnvelope reply)
             {
+                Interlocked.Increment(ref sumsum);
 
                 // Interlocked.Increment(ref totMsgCl);
                 //for (int i = 0; i < reply.PayloadCount; i++)

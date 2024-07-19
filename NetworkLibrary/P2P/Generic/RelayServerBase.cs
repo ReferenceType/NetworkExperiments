@@ -252,6 +252,7 @@ namespace NetworkLibrary.P2P.Generic
                         break;
 
                     default:
+                        //Console.WriteLine($"Internal message getting routed Header = {message.Header}");
                         SendAsyncMessage(message.To, message);
                         break;
                 }
