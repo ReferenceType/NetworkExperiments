@@ -14,7 +14,10 @@ using NetworkLibrary.Utils;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Diagnostics;
+using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
@@ -116,6 +119,9 @@ namespace NetworkLibrary.P2P.Generic
         private X509Certificate2 clientCert;
         private int udpPort = 0;
         private bool initialised = false;
+        private Stopwatch clientClock = new Stopwatch();
+        double timeOffset;
+        long syncCount = 0;
         public RelayClientBase(X509Certificate2 clientCert, int udpPort = 0)
         {
             if (clientCert == null)
@@ -142,8 +148,175 @@ namespace NetworkLibrary.P2P.Generic
             udpServer.SocketSendBufferSize = 12800000;
             udpServer.OnBytesRecieved += HandleUdpBytesReceived;
             udpServer.StartServer();
+
+            clientClock.Start();
         }
-        public void GetTcpStatistics(out TcpStatistics stats) => tcpMessageClient.GetStatistics(out stats);
+        public double GetTime()
+        {
+            return clientClock.Elapsed.TotalMilliseconds + timeOffset;
+        }
+
+        AsyncDispatcher timesyncOperation;
+        public void StartAutoTimeSync(int periodMs,bool disconnectOnTimeout,bool usePTP = false)
+        {
+            Interlocked.Exchange(ref timesyncOperation, new AsyncDispatcher())?.Abort();
+            timesyncOperation.LoopPeriodicTask(async () => 
+            {
+                try
+                {
+                    if (Interlocked.CompareExchange(ref disposed, 0, 0) == 0)
+                    {
+                        if (IsConnected)
+                        {
+                            bool result = await SyncTime(usePTP).ConfigureAwait(false);
+                            if (disconnectOnTimeout && result == false)
+                            {
+                                MiniLogger.Log(MiniLogger.LogLevel.Error, "TimeSync operation timed out ");
+                                Disconnect();
+                            }
+                        }
+                        
+                    }
+                    else
+                    {
+                        timesyncOperation.Abort();
+                    }
+                }
+                catch(Exception e) 
+                {
+                    MiniLogger.Log(MiniLogger.LogLevel.Error, "TimeSync operation failed with exception " + e.Message);
+                    Disconnect();
+                }
+
+            }, periodMs).ConfigureAwait(false);
+        }
+
+        public void StopAutoTimeSync()
+        {
+            timesyncOperation?.Abort();
+        }
+
+      
+        List<double> timesHistory = new List<double>();
+        private static readonly SemaphoreSlim asyncLock = new SemaphoreSlim(1, 1);
+        public async Task<bool> SyncTime(bool usePtp = false)
+        {
+            try
+            {
+                await asyncLock.WaitAsync();
+
+                if (!IsConnected)
+                    return false;
+
+                int sampleSize = 3;
+                var sCnt = Interlocked.CompareExchange(ref syncCount, 0, 0);
+
+                if (sCnt == 0)
+                    sampleSize = 12;
+
+                if (sCnt > 50)
+                    sampleSize = 2;
+
+                if (sCnt > 100)
+                    sampleSize = 1;
+
+
+                for (int i = 0; i < sampleSize; i++)
+                {
+                    var result = usePtp?await GetOffsetPTP(): await GetOffsetNTP();
+                    if (result.Succes)
+                    {
+                        timesHistory.Add(result.Value);
+                    }
+                    else return false;
+                }
+
+                if(timesHistory.Count<4)
+                    return false;
+
+                var times = Statistics.FilterOutliers(timesHistory);
+                if (timesHistory.Count > 600)
+                {
+                    timesHistory = timesHistory.Skip(60).ToList();
+                }
+
+                double average = times.Sum() / times.Count();
+                timeOffset = average;
+
+                Interlocked.Increment(ref syncCount);
+                return true;
+
+            }
+            finally 
+            { 
+                asyncLock.Release();
+            }
+
+        }
+        class TimeResult { public double Value; public bool Succes; }
+        private async Task<TimeResult> GetOffsetNTP()
+        {
+            var msg = new MessageEnvelope()
+            {
+                Header = Constants.TimeSync,
+                IsInternal = true,
+            };
+            var now = clientClock.Elapsed.TotalMilliseconds;
+            var response = await tcpMessageClient.SendMessageAndWaitResponse(msg, 10000);
+            if (response.Header != MessageEnvelope.RequestTimeout)
+            {
+
+                var serverTime = PrimitiveEncoder.ReadFixedDouble(response.Payload, response.PayloadOffset);
+                var now1 = clientClock.Elapsed.TotalMilliseconds;
+
+                var timeOffset = ((serverTime - now) + (serverTime - now1)) / 2;
+                return new TimeResult() { Value = timeOffset, Succes = true };
+            }
+            return new TimeResult();
+
+        }
+
+        private async Task<TimeResult> GetOffsetPTP()
+        {
+
+            var t1 = await GetServerTime();
+            if (t1.Succes)
+            {
+                var t2 = clientClock.Elapsed.TotalMilliseconds;
+
+                var t3 = t2;
+                var t4 = await GetServerTime();
+
+                if (t4.Succes)
+                {
+                    double offset =  ( ((t4.Value - t3) - (t2 - t1.Value)) / 2);
+                    return new TimeResult() { Value = offset, Succes = true };
+                }
+                else
+                    return new TimeResult();
+            }
+            else
+                return new TimeResult();
+
+        }
+
+        private async Task<TimeResult> GetServerTime()
+        {
+            var msg = new MessageEnvelope()
+            {
+                Header = Constants.TimeSync,
+                IsInternal = true,
+            };
+            var response = await tcpMessageClient.SendMessageAndWaitResponse(msg, 10000);
+            if (response.Header != MessageEnvelope.RequestTimeout)
+            {
+                var serverTime = PrimitiveEncoder.ReadFixedDouble(response.Payload, response.PayloadOffset);
+                return new TimeResult() { Value = serverTime, Succes = true };
+            }
+            return new TimeResult();
+
+        }
+    public void GetTcpStatistics(out TcpStatistics stats) => tcpMessageClient.GetStatistics(out stats);
 
         private bool CertificateValidation(object sender, X509Certificate certificate, X509Chain chain, SslPolicyErrors sslPolicyErrors)
         {
@@ -242,8 +415,10 @@ namespace NetworkLibrary.P2P.Generic
                         IsConnected = true;
                         pinger.PeerRegistered(sessionId);
 
+                        timesHistory.Clear();
+                        syncCount = 0;
+                       
                         stateCompletion.SetResult(true);
-
                     }
                     else stateCompletion.TrySetException(new TimeoutException());
                 };
