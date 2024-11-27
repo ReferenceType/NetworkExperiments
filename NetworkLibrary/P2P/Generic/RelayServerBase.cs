@@ -260,7 +260,7 @@ namespace NetworkLibrary.P2P.Generic
                         byte[] time = new byte[8];
                         message.Payload = time;
                         PrimitiveEncoder.WriteFixedDouble(time, 0, serverClock.Elapsed.TotalMilliseconds);
-
+                        message.TimeStamp = DateTime.UtcNow;
                         SendAsyncMessage(clientId, message);
 
                         break;

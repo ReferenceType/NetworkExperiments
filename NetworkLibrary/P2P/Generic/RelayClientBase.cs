@@ -121,6 +121,7 @@ namespace NetworkLibrary.P2P.Generic
         private bool initialised = false;
         private Stopwatch clientClock = new Stopwatch();
         double timeOffset;
+        TimeSpan timeOffsetd;
         long syncCount = 0;
         public RelayClientBase(X509Certificate2 clientCert, int udpPort = 0)
         {
@@ -156,10 +157,16 @@ namespace NetworkLibrary.P2P.Generic
             return clientClock.Elapsed.TotalMilliseconds + timeOffset;
         }
 
+        public DateTime GetDateTime()
+        {
+            return DateTime.UtcNow.Add(timeOffsetd);
+        }
+
         AsyncDispatcher timesyncOperation;
         public void StartAutoTimeSync(int periodMs,bool disconnectOnTimeout,bool usePTP = false)
         {
             Interlocked.Exchange(ref timesyncOperation, new AsyncDispatcher())?.Abort();
+            int failureCount = 0;
             timesyncOperation.LoopPeriodicTask(async () => 
             {
                 try
@@ -169,10 +176,18 @@ namespace NetworkLibrary.P2P.Generic
                         if (IsConnected)
                         {
                             bool result = await SyncTime(usePTP).ConfigureAwait(false);
-                            if (disconnectOnTimeout && result == false)
+                            if (disconnectOnTimeout && result == false )
                             {
-                                MiniLogger.Log(MiniLogger.LogLevel.Error, "TimeSync operation timed out ");
-                                Disconnect();
+                                if (++failureCount > 2)
+                                {
+                                    MiniLogger.Log(MiniLogger.LogLevel.Error, "TimeSync operation timed out ");
+                                    Disconnect();
+                                }
+                               
+                            }
+                            else
+                            {
+                                failureCount = 0;
                             }
                         }
                         
@@ -198,12 +213,13 @@ namespace NetworkLibrary.P2P.Generic
 
       
         List<double> timesHistory = new List<double>();
+        List<TimeSpan> timesHistoryd = new List<TimeSpan>();
         private static readonly SemaphoreSlim asyncLock = new SemaphoreSlim(1, 1);
         public async Task<bool> SyncTime(bool usePtp = false)
         {
             try
             {
-                await asyncLock.WaitAsync();
+                await asyncLock.WaitAsync().ConfigureAwait(false);
 
                 if (!IsConnected)
                     return false;
@@ -223,10 +239,11 @@ namespace NetworkLibrary.P2P.Generic
 
                 for (int i = 0; i < sampleSize; i++)
                 {
-                    var result = usePtp?await GetOffsetPTP(): await GetOffsetNTP();
+                    var result = usePtp?await GetOffsetPTP().ConfigureAwait(false): await GetOffsetNTP().ConfigureAwait(false);
                     if (result.Succes)
                     {
-                        timesHistory.Add(result.Value);
+                        timesHistory.Add(result.PreciseTime);
+                        timesHistoryd.Add(result.DateTimeOffset);
                     }
                     else return false;
                 }
@@ -235,13 +252,29 @@ namespace NetworkLibrary.P2P.Generic
                     return false;
 
                 var times = Statistics.FilterOutliers(timesHistory);
+                var timesd = Statistics.FilterOutliers(timesHistoryd);
                 if (timesHistory.Count > 600)
                 {
                     timesHistory = timesHistory.Skip(60).ToList();
+                    timesHistoryd = timesHistoryd.Skip(60).ToList();
                 }
 
                 double average = times.Sum() / times.Count();
+                double averaged = timesd.Sum(ts => ts.Ticks) / timesd.Count();
                 timeOffset = average;
+
+                if (sCnt > 0)
+                {
+                    var calculatedAvg = TimeSpan.FromTicks((long)averaged);
+                    if (timeOffsetd < calculatedAvg)
+                    {
+                        timeOffsetd = calculatedAvg;
+                    }
+                }
+                else
+                {
+                    timeOffsetd = TimeSpan.FromTicks((long)averaged);
+                }
 
                 Interlocked.Increment(ref syncCount);
                 return true;
@@ -253,7 +286,7 @@ namespace NetworkLibrary.P2P.Generic
             }
 
         }
-        class TimeResult { public double Value; public bool Succes; }
+        class TimeResult { public double PreciseTime; public bool Succes; public DateTime ServerUTC; public TimeSpan DateTimeOffset; }
         private async Task<TimeResult> GetOffsetNTP()
         {
             var msg = new MessageEnvelope()
@@ -262,15 +295,23 @@ namespace NetworkLibrary.P2P.Generic
                 IsInternal = true,
             };
             var now = clientClock.Elapsed.TotalMilliseconds;
-            var response = await tcpMessageClient.SendMessageAndWaitResponse(msg, 10000);
+            var nowd = DateTime.UtcNow;
+
+            var response = await tcpMessageClient.SendMessageAndWaitResponse(msg, 10000).ConfigureAwait(false);
             if (response.Header != MessageEnvelope.RequestTimeout)
             {
 
                 var serverTime = PrimitiveEncoder.ReadFixedDouble(response.Payload, response.PayloadOffset);
+                var serverTimed = response.TimeStamp;
+
                 var now1 = clientClock.Elapsed.TotalMilliseconds;
+                var now1d = DateTime.UtcNow;
 
                 var timeOffset = ((serverTime - now) + (serverTime - now1)) / 2;
-                return new TimeResult() { Value = timeOffset, Succes = true };
+                var timeOffsetd = ((serverTimed - nowd) + (serverTimed - now1d)).TotalMilliseconds / 2;
+                TimeSpan offd = TimeSpan.FromMilliseconds(timeOffsetd);
+
+                return new TimeResult() { PreciseTime = timeOffset, DateTimeOffset = offd, Succes = true };
             }
             return new TimeResult();
 
@@ -283,14 +324,19 @@ namespace NetworkLibrary.P2P.Generic
             if (t1.Succes)
             {
                 var t2 = clientClock.Elapsed.TotalMilliseconds;
+                var t2d = DateTime.UtcNow;
 
                 var t3 = t2;
+                var t3d = t2d;
+
                 var t4 = await GetServerTime();
 
                 if (t4.Succes)
                 {
-                    double offset =  ( ((t4.Value - t3) - (t2 - t1.Value)) / 2);
-                    return new TimeResult() { Value = offset, Succes = true };
+                    double offset =  ( ((t4.PreciseTime - t3) - (t2 - t1.PreciseTime)) / 2);
+                    double offsetd =  ( ((t4.ServerUTC - t3d) - (t2d - t1.ServerUTC)).TotalMilliseconds / 2);
+                    TimeSpan offd =TimeSpan.FromMilliseconds(offsetd);
+                    return new TimeResult() { PreciseTime = offset, DateTimeOffset = offd, Succes = true };
                 }
                 else
                     return new TimeResult();
@@ -311,7 +357,7 @@ namespace NetworkLibrary.P2P.Generic
             if (response.Header != MessageEnvelope.RequestTimeout)
             {
                 var serverTime = PrimitiveEncoder.ReadFixedDouble(response.Payload, response.PayloadOffset);
-                return new TimeResult() { Value = serverTime, Succes = true };
+                return new TimeResult() { PreciseTime = serverTime, ServerUTC = response.TimeStamp, Succes = true };
             }
             return new TimeResult();
 
@@ -392,7 +438,15 @@ namespace NetworkLibrary.P2P.Generic
 
                 relayServerEndpoint = new IPEndPoint(IPAddress.Parse(connectHost), connectPort);
 
-                await tcpMessageClient.ConnectAsync(host, port).ConfigureAwait(false);
+                bool result = await tcpMessageClient.ConnectAsync(host, port).ConfigureAwait(false);
+                if (!result)
+                {
+                    throw new TimeoutException();
+                }
+                else
+                {
+                    MiniLogger.Log(MiniLogger.LogLevel.Info, "Connection established");
+                }
 
                 var stateCompletion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
                 clientStateManager.CreateConnectionState()

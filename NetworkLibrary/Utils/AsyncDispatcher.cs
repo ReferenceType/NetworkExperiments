@@ -101,10 +101,10 @@ namespace NetworkLibrary.Utils
                 try
                 {
                     if (Interlocked.CompareExchange(ref cancel, 0, 0) > 0) return;
-                    await Task.Delay(ms).ConfigureAwait(false);
+                        await Task.Delay(ms).ConfigureAwait(false);
 
                     if (Interlocked.CompareExchange(ref cancel, 0, 0) > 0) return;
-                    await asyncTask.Invoke().ConfigureAwait(false);
+                        await asyncTask.Invoke().ConfigureAwait(false);
                 }
                 catch (Exception e)
                 {

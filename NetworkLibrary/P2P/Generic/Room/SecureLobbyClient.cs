@@ -52,6 +52,7 @@ namespace NetworkLibrary.P2P.Generic.Room
         public void StopAutoTimeSync()=>client.StopAutoTimeSync();
 
         public double GetTime() => client.GetTime();
+        public DateTime GetDateTime() => client.GetDateTime();
         private bool CertificateValidation(object sender, X509Certificate certificate, X509Chain chain, SslPolicyErrors sslPolicyErrors)
         {
             if (RemoteCertificateValidationCallback == null)
